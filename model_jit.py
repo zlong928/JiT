@@ -7,11 +7,31 @@ import torch
 import torch.nn as nn
 import math
 import torch.nn.functional as F
+import os
 from util.model_util import VisionRotaryEmbeddingFast, get_2d_sincos_pos_embed, RMSNorm
 
 
 def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+
+
+def optional_compile(fn):
+    """Compile only when explicitly enabled and backend support is available."""
+    # Default to eager mode for better cross-platform stability (Windows + new GPUs).
+    if os.environ.get("JIT_ENABLE_COMPILE", "0") != "1":
+        return fn
+    if os.environ.get("JIT_DISABLE_COMPILE", "0") == "1":
+        return fn
+    if not hasattr(torch, "compile"):
+        return fn
+    try:
+        import triton  # noqa: F401
+    except Exception:
+        return fn
+    try:
+        return torch.compile(fn)
+    except Exception:
+        return fn
 
 
 class BottleneckPatchEmbed(nn.Module):
@@ -92,15 +112,23 @@ class LabelEmbedder(nn.Module):
 
 
 def scaled_dot_product_attention(query, key, value, dropout_p=0.0) -> torch.Tensor:
-    L, S = query.size(-2), key.size(-2)
-    scale_factor = 1 / math.sqrt(query.size(-1))
-    attn_bias = torch.zeros(query.size(0), 1, L, S, dtype=query.dtype).cuda()
+    # Prefer PyTorch fused attention kernel for better speed and memory behavior.
+    if hasattr(F, "scaled_dot_product_attention"):
+        return F.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            attn_mask=None,
+            dropout_p=dropout_p,
+            is_causal=False,
+        )
 
+    scale_factor = 1 / math.sqrt(query.size(-1))
     with torch.cuda.amp.autocast(enabled=False):
         attn_weight = query.float() @ key.float().transpose(-2, -1) * scale_factor
-    attn_weight += attn_bias
     attn_weight = torch.softmax(attn_weight, dim=-1)
-    attn_weight = torch.dropout(attn_weight, dropout_p, train=True)
+    if dropout_p > 0.0:
+        attn_weight = torch.dropout(attn_weight, dropout_p, train=True)
     return attn_weight @ value
 
 
@@ -120,6 +148,7 @@ class Attention(nn.Module):
 
     def forward(self, x, rope):
         B, N, C = x.shape
+        # qkv: [B, heads, tokens, head_dim]
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]   # make torchscript happy (cannot use tensor as tuple)
 
@@ -129,7 +158,7 @@ class Attention(nn.Module):
         q = rope(q)
         k = rope(k)
 
-        x = scaled_dot_product_attention(q, k, v, dropout_p=self.attn_drop.p if self.training else 0.)
+        x = scaled_dot_product_attention(q, k, v, dropout_p=self.attn_drop.p if self.training else 0.0)
 
         x = x.transpose(1, 2).reshape(B, N, C)
 
@@ -172,7 +201,7 @@ class FinalLayer(nn.Module):
             nn.Linear(hidden_size, 2 * hidden_size, bias=True)
         )
 
-    @torch.compile
+    @optional_compile
     def forward(self, x, c):
         shift, scale = self.adaLN_modulation(c).chunk(2, dim=1)
         x = modulate(self.norm_final(x), shift, scale)
@@ -194,7 +223,7 @@ class JiTBlock(nn.Module):
             nn.Linear(hidden_size, 6 * hidden_size, bias=True)
         )
 
-    @torch.compile
+    @optional_compile
     def forward(self, x,  c, feat_rope=None):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=-1)
         x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa), rope=feat_rope)

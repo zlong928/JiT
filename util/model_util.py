@@ -121,17 +121,24 @@ class VisionRotaryEmbeddingFast(nn.Module):
             sin_img = freqs_flat.sin()
 
             # prepend in-context cls token
-            N_img, D = cos_img.shape
-            cos_pad = torch.ones(num_cls_token, D, dtype=cos_img.dtype, device=cos_img.device)
-            sin_pad = torch.zeros(num_cls_token, D, dtype=sin_img.dtype, device=sin_img.device)
+            _n_img, d_model = cos_img.shape
+            cos_pad = torch.ones(num_cls_token, d_model, dtype=cos_img.dtype, device=cos_img.device)
+            sin_pad = torch.zeros(num_cls_token, d_model, dtype=sin_img.dtype, device=sin_img.device)
 
-            self.freqs_cos = torch.cat([cos_pad, cos_img], dim=0).cuda()  # [N_cls+N_img, D]
-            self.freqs_sin = torch.cat([sin_pad, sin_img], dim=0).cuda()
+            freqs_cos = torch.cat([cos_pad, cos_img], dim=0)  # [N_cls+N_img, D]
+            freqs_sin = torch.cat([sin_pad, sin_img], dim=0)
         else:
-            self.freqs_cos = freqs.cos().view(-1, freqs.shape[-1]).cuda()
-            self.freqs_sin = freqs.sin().view(-1, freqs.shape[-1]).cuda()
+            freqs_cos = freqs.cos().view(-1, freqs.shape[-1])
+            freqs_sin = freqs.sin().view(-1, freqs.shape[-1])
 
-    def forward(self, t): return  t * self.freqs_cos + rotate_half(t) * self.freqs_sin
+        # Keep RoPE tables as buffers so DDP / `.to(device)` handles placement.
+        self.register_buffer("freqs_cos", freqs_cos, persistent=False)
+        self.register_buffer("freqs_sin", freqs_sin, persistent=False)
+
+    def forward(self, t):
+        freqs_cos = self.freqs_cos.to(dtype=t.dtype, device=t.device)
+        freqs_sin = self.freqs_sin.to(dtype=t.dtype, device=t.device)
+        return t * freqs_cos + rotate_half(t) * freqs_sin
 
 
 class RMSNorm(nn.Module):

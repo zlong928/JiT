@@ -46,17 +46,26 @@ class Denoiser(nn.Module):
         z = torch.randn(n, device=device) * self.P_std + self.P_mean
         return torch.sigmoid(z)
 
+    def _velocity_from_prediction(self, x_pred, z, t):
+        return (x_pred - z) / (1.0 - t).clamp_min(self.t_eps)
+
+    def _cfg_scale_for_t(self, t):
+        low, high = self.cfg_interval
+        interval_mask = (t < high) & ((low == 0) | (t > low))
+        return torch.where(interval_mask, self.cfg_scale, 1.0)
+
     def forward(self, x, labels):
         labels_dropped = self.drop_labels(labels) if self.training else labels
 
         t = self.sample_t(x.size(0), device=x.device).view(-1, *([1] * (x.ndim - 1)))
         e = torch.randn_like(x) * self.noise_scale
 
+        # Interpolate between data and noise, then regress velocity in the same space.
         z = t * x + (1 - t) * e
-        v = (x - z) / (1 - t).clamp_min(self.t_eps)
+        v = self._velocity_from_prediction(x, z, t)
 
         x_pred = self.net(z, t.flatten(), labels_dropped)
-        v_pred = (x_pred - z) / (1 - t).clamp_min(self.t_eps)
+        v_pred = self._velocity_from_prediction(x_pred, z, t)
 
         # l2 loss
         loss = (v - v_pred) ** 2
@@ -69,7 +78,8 @@ class Denoiser(nn.Module):
         device = labels.device
         bsz = labels.size(0)
         z = self.noise_scale * torch.randn(bsz, 3, self.img_size, self.img_size, device=device)
-        timesteps = torch.linspace(0.0, 1.0, self.steps+1, device=device).view(-1, *([1] * z.ndim)).expand(-1, bsz, -1, -1, -1)
+        timesteps = torch.linspace(0.0, 1.0, self.steps + 1, device=device)
+        timesteps = timesteps.view(-1, *([1] * z.ndim)).expand(-1, bsz, -1, -1, -1)
 
         if self.method == "euler":
             stepper = self._euler_step
@@ -91,16 +101,12 @@ class Denoiser(nn.Module):
     def _forward_sample(self, z, t, labels):
         # conditional
         x_cond = self.net(z, t.flatten(), labels)
-        v_cond = (x_cond - z) / (1.0 - t).clamp_min(self.t_eps)
+        v_cond = self._velocity_from_prediction(x_cond, z, t)
 
         # unconditional
         x_uncond = self.net(z, t.flatten(), torch.full_like(labels, self.num_classes))
-        v_uncond = (x_uncond - z) / (1.0 - t).clamp_min(self.t_eps)
-
-        # cfg interval
-        low, high = self.cfg_interval
-        interval_mask = (t < high) & ((low == 0) | (t > low))
-        cfg_scale_interval = torch.where(interval_mask, self.cfg_scale, 1.0)
+        v_uncond = self._velocity_from_prediction(x_uncond, z, t)
+        cfg_scale_interval = self._cfg_scale_for_t(t)
 
         return v_uncond + cfg_scale_interval * (v_cond - v_uncond)
 

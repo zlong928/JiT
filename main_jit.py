@@ -146,9 +146,12 @@ def main(args):
     dataset_train = datasets.ImageFolder(os.path.join(args.data_path, 'train'), transform=transform_train)
     print(dataset_train)
 
-    sampler_train = torch.utils.data.DistributedSampler(
-        dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True
-    )
+    if args.distributed:
+        sampler_train = torch.utils.data.DistributedSampler(
+            dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True
+        )
+    else:
+        sampler_train = torch.utils.data.RandomSampler(dataset_train)
     print("Sampler_train =", sampler_train)
 
     data_loader_train = torch.utils.data.DataLoader(
@@ -179,8 +182,11 @@ def main(args):
     print("Actual lr: {:.2e}".format(args.lr))
     print("Effective batch size: %d" % eff_batch_size)
 
-    model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
-    model_without_ddp = model.module
+    if args.distributed:
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
+        model_without_ddp = model.module
+    else:
+        model_without_ddp = model
 
     # Set up optimizer with weight decay adjustment for bias and norm layers
     param_groups = misc.add_weight_decay(model_without_ddp, args.weight_decay)
@@ -191,13 +197,43 @@ def main(args):
     checkpoint_path = os.path.join(args.resume, "checkpoint-last.pth") if args.resume else None
     if checkpoint_path and os.path.exists(checkpoint_path):
         checkpoint = torch.load(checkpoint_path, map_location='cpu')
-        model_without_ddp.load_state_dict(checkpoint['model'])
 
-        ema_state_dict1 = checkpoint['model_ema1']
-        ema_state_dict2 = checkpoint['model_ema2']
-        model_without_ddp.ema_params1 = [ema_state_dict1[name].cuda() for name, _ in model_without_ddp.named_parameters()]
-        model_without_ddp.ema_params2 = [ema_state_dict2[name].cuda() for name, _ in model_without_ddp.named_parameters()]
+        model_state = checkpoint['model']
+        target_state = model_without_ddp.state_dict()
+        filtered_state = {}
+        skipped_keys = []
+        for k, v in model_state.items():
+            if k not in target_state:
+                skipped_keys.append(k)
+                continue
+            if target_state[k].shape != v.shape:
+                skipped_keys.append(k)
+                continue
+            filtered_state[k] = v
+        load_ret = model_without_ddp.load_state_dict(filtered_state, strict=False)
+
+        ema_state_dict1 = checkpoint.get('model_ema1', {})
+        ema_state_dict2 = checkpoint.get('model_ema2', {})
+        named_params = list(model_without_ddp.named_parameters())
+        model_without_ddp.ema_params1 = []
+        model_without_ddp.ema_params2 = []
+        for name, p in named_params:
+            e1 = ema_state_dict1.get(name, None)
+            e2 = ema_state_dict2.get(name, None)
+            if e1 is None or e1.shape != p.shape:
+                e1 = p.detach().clone()
+            if e2 is None or e2.shape != p.shape:
+                e2 = p.detach().clone()
+            model_without_ddp.ema_params1.append(e1.to(device))
+            model_without_ddp.ema_params2.append(e2.to(device))
+
         print("Resumed checkpoint from", args.resume)
+        if skipped_keys:
+            print(f"Skipped incompatible checkpoint keys: {len(skipped_keys)}")
+        if getattr(load_ret, "missing_keys", None):
+            print(f"Missing keys after resume load: {len(load_ret.missing_keys)}")
+        if getattr(load_ret, "unexpected_keys", None):
+            print(f"Unexpected keys after resume load: {len(load_ret.unexpected_keys)}")
 
         if 'optimizer' in checkpoint and 'epoch' in checkpoint:
             optimizer.load_state_dict(checkpoint['optimizer'])
